@@ -87,14 +87,15 @@ def save_samples(original, masked, reconstructed, pixel_mask, epoch, count=8):
             masked[index:index + 1], reconstructed[index:index + 1], mask
         )[0]
 
-        # Refine the decoder prediction, then copy observed pixels back exactly.
-        # This keeps post-processing from changing any unmasked input pixels.
-        refined_prediction = refine_colour_regions(reconstructed[index])
-        refined_completed = completed_image(
-            masked[index:index + 1],
-            refined_prediction.unsqueeze(0),
-            mask,
-        )[0]
+        # Visible, unmasked pixels act as exact colour seeds. The postprocessor
+        # expands those colours through predicted foreground regions while
+        # preserving the observed pixels.
+        known_pixels = 1.0 - mask[0]
+        refined_completed = refine_colour_regions(
+            raw_completed,
+            known_mask=known_pixels,
+            background_threshold=0.16,
+        )
 
         panels = [
             tensor_to_pil(original[index]),
@@ -185,13 +186,7 @@ def save_checkpoint(epoch, encoders, predictor, decoder, optimizer, metrics, pat
             ],
             "target_encoder_update": "EMA only; no gradients",
         },
-        "decoder": "coarse RGB prediction followed by strict nearest-neighbour expansion",
-        "postprocessing": {
-            "method": "border-background threshold + 4-connected component median-colour fill",
-            "background_threshold_rgb_distance": 0.16,
-            "minimum_component_area": 2,
-            "training_loss": "none; presentation/evaluation only",
-        },
+        "decoder_description": "nearest-colour expansion with learned boundary-gated refinement",
         "run_name": RUN_NAME,
     }, path)
 
@@ -338,8 +333,7 @@ def train():
     )
     print("Gradient routing: JEPA -> context encoder + predictor")
     print("Gradient routing: full-image L1 -> context encoder + predictor + decoder")
-    print("Decoder: coarse RGB prediction + strict nearest-neighbour expansion")
-    print("Sample post-processing: background threshold + connected-component median-colour fill")
+    print("Decoder: nearest-colour expansion + learned boundary-gated refinement")
 
     for epoch in range(1, EPOCHS + 1):
         encoders.train()
