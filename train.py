@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from dataset import ShapesDataset
 from models import JEPAEncoders, JEPAPredictor, CNNDecoder, combine_features
 from losses import compute_losses
+from postprocess import refine_colour_regions
 
 
 # ---------------- Configuration ----------------
@@ -78,19 +79,30 @@ def completed_image(masked, reconstructed, pixel_mask):
 
 
 def save_samples(original, masked, reconstructed, pixel_mask, epoch, count=8):
+    """Save four panels: original, masked, raw completion, refined completion."""
     count = min(count, original.size(0))
     for index in range(count):
-        completed = completed_image(
-            masked[index:index + 1],
-            reconstructed[index:index + 1],
-            pixel_mask[index:index + 1],
+        mask = pixel_mask[index:index + 1]
+        raw_completed = completed_image(
+            masked[index:index + 1], reconstructed[index:index + 1], mask
         )[0]
+
+        # Refine the decoder prediction, then copy observed pixels back exactly.
+        # This keeps post-processing from changing any unmasked input pixels.
+        refined_prediction = refine_colour_regions(reconstructed[index])
+        refined_completed = completed_image(
+            masked[index:index + 1],
+            refined_prediction.unsqueeze(0),
+            mask,
+        )[0]
+
         panels = [
             tensor_to_pil(original[index]),
             tensor_to_pil(masked[index]),
-            tensor_to_pil(completed),
+            tensor_to_pil(raw_completed),
+            tensor_to_pil(refined_completed),
         ]
-        canvas = Image.new("RGB", (64 * 3, 64))
+        canvas = Image.new("RGB", (64 * 4, 64))
         for panel_index, panel in enumerate(panels):
             canvas.paste(panel, (panel_index * 64, 0))
         canvas.save(
@@ -173,7 +185,13 @@ def save_checkpoint(epoch, encoders, predictor, decoder, optimizer, metrics, pat
             ],
             "target_encoder_update": "EMA only; no gradients",
         },
-        "decoder": "nearest-colour expansion with learned boundary-gated refinement",
+        "decoder": "coarse RGB prediction followed by strict nearest-neighbour expansion",
+        "postprocessing": {
+            "method": "border-background threshold + 4-connected component median-colour fill",
+            "background_threshold_rgb_distance": 0.16,
+            "minimum_component_area": 2,
+            "training_loss": "none; presentation/evaluation only",
+        },
         "run_name": RUN_NAME,
     }, path)
 
@@ -320,7 +338,8 @@ def train():
     )
     print("Gradient routing: JEPA -> context encoder + predictor")
     print("Gradient routing: full-image L1 -> context encoder + predictor + decoder")
-    print("Decoder: nearest-colour expansion + learned boundary-gated refinement")
+    print("Decoder: coarse RGB prediction + strict nearest-neighbour expansion")
+    print("Sample post-processing: background threshold + connected-component median-colour fill")
 
     for epoch in range(1, EPOCHS + 1):
         encoders.train()
