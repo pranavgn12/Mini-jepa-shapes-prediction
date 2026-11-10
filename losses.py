@@ -1,80 +1,73 @@
-
 import torch
 import torch.nn.functional as F
 
 
-def jepa_loss(
+def jepa_loss(predicted_tokens, target_features, target_mask):
+    """
+    JEPA MSE on masked latent positions only.
+    predicted_tokens: (B, N, C)
+    target_features:  (B, C, H, W) or (B, N, C)
+    target_mask:      (B, 1, H, W) or (B, H, W)
+    """
+    if target_features.ndim == 4:
+        target_tokens = target_features.flatten(2).transpose(1, 2)
+    elif target_features.ndim == 3:
+        target_tokens = target_features
+    else:
+        raise ValueError("target_features must be (B,C,H,W) or (B,N,C)")
+
+    if predicted_tokens.shape != target_tokens.shape:
+        raise ValueError(
+            f"Predictor/target mismatch: {predicted_tokens.shape} "
+            f"vs {target_tokens.shape}"
+        )
+
+    if target_mask.ndim == 4:
+        mask = target_mask.flatten(1)
+    elif target_mask.ndim == 3:
+        mask = target_mask.flatten(1)
+    else:
+        raise ValueError("target_mask must be (B,1,H,W) or (B,H,W)")
+
+    errors = (predicted_tokens - target_tokens.detach()).square().mean(dim=-1)
+    mask = mask.to(errors.dtype)
+    counts = mask.sum(dim=1)
+
+    per_sample = (errors * mask).sum(dim=1) / counts.clamp_min(1.0)
+    # Defensive fallback if a sample happens to contain no masked latent cells.
+    per_sample = torch.where(counts > 0, per_sample, errors.mean(dim=1))
+    return per_sample.mean()
+
+
+def full_image_reconstruction_loss(predicted_image, original_image):
+    """
+    Full-image L1: every RGB pixel contributes, not just masked pixels.
+    The original image is a target only; it is never a decoder input.
+    """
+    if predicted_image.shape != original_image.shape:
+        raise ValueError(
+            f"Image shape mismatch: {predicted_image.shape} "
+            f"vs {original_image.shape}"
+        )
+    return F.l1_loss(predicted_image, original_image)
+
+
+def compute_losses(
     predicted_tokens,
     target_features,
-    target_mask
+    latent_mask,
+    reconstructed_image,
+    original_image,
+    lambda_jepa=1.0,
+    lambda_reconstruction=1.0,
 ):
-    """
-    Compare predicted and target embeddings
-    only at masked spatial positions.
-
-    predicted_tokens: (B,64,128)
-    target_features:  (B,128,8,8)
-    target_mask:      (B,1,8,8)
-    """
-
-    # Convert target features into spatial tokens.
-    target_tokens = (
-        target_features.flatten(2).transpose(1, 2)
+    jepa = jepa_loss(predicted_tokens, target_features, latent_mask)
+    reconstruction = full_image_reconstruction_loss(
+        reconstructed_image, original_image
     )
-
-    # Convert mask to (B,64).
-    mask = target_mask.flatten(1).bool()
-
-    # Select masked positions from both tensors.
-    predicted_targets = predicted_tokens[mask]
-    actual_targets = target_tokens[mask]
-
-    # Embedding-space prediction loss.
-    loss = F.smooth_l1_loss(
-        predicted_targets,
-        actual_targets
-    )
-
-    return loss
-
-
-def reconstruction_loss(
-    reconstructed,
-    original,
-    pixel_mask
-):
-    """
-    Calculate pixel reconstruction loss
-    only over masked regions.
-
-    reconstructed: (B,3,64,64)
-    original:      (B,3,64,64)
-    pixel_mask:    (B,1,64,64)
-    """
-
-    # Absolute pixel differences.
-    difference = torch.abs(reconstructed - original)
-
-    # Ignore visible pixels.
-    masked_difference = difference * pixel_mask
-
-    # Normalize by the number of masked RGB values.
-    denominator = (
-        pixel_mask.sum() * reconstructed.shape[1]
-    ).clamp(min=1)
-
-    return masked_difference.sum() / denominator
-
-
-def combined_loss(
-    loss_jepa,
-    loss_reconstruction,
-    lambda_reconstruction=1.0
-):
-
-    total = (
-        loss_jepa
-        + lambda_reconstruction * loss_reconstruction
-    )
-
-    return total
+    total = lambda_jepa * jepa + lambda_reconstruction * reconstruction
+    return {
+        "jepa": jepa,
+        "reconstruction": reconstruction,
+        "total": total,
+    }

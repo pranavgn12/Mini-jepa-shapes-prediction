@@ -1,48 +1,43 @@
-
 import random
+
 from PIL import Image, ImageDraw
 
-IMAGE_SIZE = 64
-MASK_COLOR = (255, 0, 255)
+
+MASK_COLOUR = (255, 0, 255)
 
 
-def apply_random_mask(image, min_blocks=1, max_blocks=3):
-    """
-    Args:
-        image: Original PIL RGB image.
+def apply_random_mask(image, min_rectangles=1, max_rectangles=3):
+    """Apply 1-3 random rectangular magenta masks to a PIL image.
 
     Returns:
-        masked_image: Image with masked regions replaced by magenta.
-        mask: PIL grayscale image (255 = masked, 0 = visible).
+      masked_image: RGB image with hidden regions filled in magenta
+      pixel_mask:   L image, 255 for hidden pixels and 0 for visible pixels
     """
+    if not isinstance(image, Image.Image):
+        raise TypeError("image must be a PIL Image")
 
+    image = image.convert("RGB")
+    width, height = image.size
     masked_image = image.copy()
+    pixel_mask = Image.new("L", (width, height), 0)
 
-    mask = Image.new("L", (IMAGE_SIZE, IMAGE_SIZE), 0)
-    draw = ImageDraw.Draw(mask)
+    image_draw = ImageDraw.Draw(masked_image)
+    mask_draw = ImageDraw.Draw(pixel_mask)
 
-    num_blocks = random.randint(min_blocks, max_blocks)
+    rectangle_count = random.randint(min_rectangles, max_rectangles)
+    for _ in range(rectangle_count):
+        rect_width = random.randint(max(8, width // 8), max(12, width // 2))
+        rect_height = random.randint(max(8, height // 8), max(12, height // 2))
+        rect_width = min(rect_width, width)
+        rect_height = min(rect_height, height)
 
-    for _ in range(num_blocks):
-        width = random.randint(8, 24)
-        height = random.randint(8, 24)
+        left = random.randint(0, width - rect_width)
+        top = random.randint(0, height - rect_height)
+        right = left + rect_width - 1
+        bottom = top + rect_height - 1
+        rectangle = (left, top, right, bottom)
 
-        x1 = random.randint(0, IMAGE_SIZE - width)
-        y1 = random.randint(0, IMAGE_SIZE - height)
+        image_draw.rectangle(rectangle, fill=MASK_COLOUR)
+        mask_draw.rectangle(rectangle, fill=255)
 
-        x2 = x1 + width - 1
-        y2 = y1 + height - 1
-
-        draw.rectangle((x1, y1, x2, y2), fill=255)
-
-    # Replace masked pixels with magenta.
-    pixels = masked_image.load()
-    mask_pixels = mask.load()
-
-    for y in range(IMAGE_SIZE):
-        for x in range(IMAGE_SIZE):
-            if mask_pixels[x, y] == 255:
-                pixels[x, y] = MASK_COLOR
-
-    return masked_image, mask
-
+    return masked_image, pixel_mask

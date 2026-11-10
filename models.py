@@ -6,95 +6,86 @@ import torch.nn.functional as F
 
 
 class CNNEncoder(nn.Module):
-    """
-    Encoder with a 16x16 latent grid for 64x64 input images.
-    Returns:
-      skip32: (B, 32, 32, 32)
-      latent16: (B, 64, 16, 16)
-    """
+    """64x64 RGB image -> 64-channel 16x16 feature grid."""
+
     def __init__(self):
         super().__init__()
-
-        self.block1 = nn.Sequential(
+        self.network = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.GELU(),
             nn.MaxPool2d(2),  # 64 -> 32
-        )
-
-        self.block2 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.GELU(),
             nn.MaxPool2d(2),  # 32 -> 16
         )
 
-    def forward(self, x):
-        skip32 = self.block1(x)
-        latent16 = self.block2(skip32)
-        return skip32, latent16
+    def forward(self, image):
+        return self.network(image)
 
 
 class JEPAEncoders(nn.Module):
+    """Online context encoder and frozen EMA target encoder."""
+
     def __init__(self, ema_decay=0.996):
         super().__init__()
-
         self.context_encoder = CNNEncoder()
         self.target_encoder = copy.deepcopy(self.context_encoder)
-
         self.ema_decay = ema_decay
         self.target_encoder.requires_grad_(False)
         self.target_encoder.eval()
 
     def train(self, mode=True):
         super().train(mode)
+        # The target encoder must remain in eval mode (notably for BatchNorm).
         self.target_encoder.eval()
         return self
 
     @torch.no_grad()
     def update_target_encoder(self):
-        for context_param, target_param in zip(
-            self.context_encoder.parameters(),
-            self.target_encoder.parameters(),
+        for online_param, target_param in zip(
+            self.context_encoder.parameters(), self.target_encoder.parameters()
         ):
             target_param.mul_(self.ema_decay)
-            target_param.add_(context_param, alpha=1.0 - self.ema_decay)
+            target_param.add_(online_param, alpha=1.0 - self.ema_decay)
 
-        # Keep BatchNorm running statistics synchronized.
-        for context_buffer, target_buffer in zip(
-            self.context_encoder.buffers(),
-            self.target_encoder.buffers(),
+        # Keep BatchNorm running statistics synchronized with the online encoder.
+        for online_buffer, target_buffer in zip(
+            self.context_encoder.buffers(), self.target_encoder.buffers()
         ):
-            target_buffer.copy_(context_buffer)
+            target_buffer.copy_(online_buffer)
 
     def forward(self, masked_image, original_image):
-        skip32, context_features = self.context_encoder(masked_image)
-
+        context_features = self.context_encoder(masked_image)
         with torch.no_grad():
-            _, target_features = self.target_encoder(original_image)
-
-        return context_features, skip32, target_features
+            target_features = self.target_encoder(original_image)
+        return context_features, target_features
 
 
 class JEPAPredictor(nn.Module):
-    """Transformer predictor operating on 16x16 = 256 spatial tokens."""
+    """Transformer predictor operating on a 16x16 grid of image tokens."""
+
     def __init__(
         self,
         embed_dim=64,
+        grid_size=16,
         num_heads=4,
         num_layers=2,
         mlp_dim=256,
         dropout=0.0,
     ):
         super().__init__()
-
-        self.num_tokens = 16 * 16
+        self.grid_size = grid_size
+        self.num_tokens = grid_size * grid_size
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.position_embedding = nn.Parameter(
             torch.zeros(1, self.num_tokens, embed_dim)
         )
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
         nn.init.trunc_normal_(self.position_embedding, std=0.02)
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=mlp_dim,
@@ -103,86 +94,133 @@ class JEPAPredictor(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, context_features, target_mask):
-        batch_size, channels, height, width = context_features.shape
+        batch, channels, height, width = context_features.shape
+        if channels != 64 or (height, width) != (self.grid_size, self.grid_size):
+            raise ValueError(
+                "Expected context features shaped "
+                f"(B,64,{self.grid_size},{self.grid_size}), got "
+                f"{tuple(context_features.shape)}"
+            )
+
         tokens = context_features.flatten(2).transpose(1, 2)
-        tokens = tokens + self.position_embedding[:, :tokens.shape[1], :]
-        predicted = self.transformer(tokens)
-        return self.norm(predicted)
+        mask_tokens = target_mask.flatten(1).bool().unsqueeze(-1)
+        mask_token = self.mask_token.expand(batch, self.num_tokens, -1)
+        tokens = torch.where(mask_tokens, mask_token, tokens)
+        tokens = tokens + self.position_embedding
+        return self.norm(self.transformer(tokens))
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        return self.activation(x + self.block(x))
 
 
 class CNNDecoder(nn.Module):
     """
-    Decode a 16x16 latent grid to a complete 64x64 RGB image.
-    The 32x32 skip features are suppressed wherever their cells overlap
-    the masked input region.
+    Nearest-colour expansion decoder.
+
+    Inputs:
+      combined_features: (B,64,16,16)
+      mask_map:          (B,1,16,16)
+
+    It predicts a coarse 16x16 RGB field, expands that field using nearest
+    interpolation (so colours are not blended), and predicts a boundary gate
+    plus a small high-resolution colour correction. The gate and correction
+    are learned only through the ordinary full-image reconstruction loss.
+
+    The original image and high-resolution encoder skip features are never
+    supplied to this decoder.
     """
+
     def __init__(self):
         super().__init__()
-
-        self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),  # 16 -> 32
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+        self.stem = nn.Sequential(
+            nn.Conv2d(65, 64, kernel_size=3, padding=1),
             nn.GELU(),
+            ResidualConvBlock(64),
+            ResidualConvBlock(64),
         )
 
-        self.refine1 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-        )
+        self.coarse_rgb_head = nn.Conv2d(64, 3, kernel_size=1)
+        self.boundary_gate_head = nn.Conv2d(64, 1, kernel_size=3, padding=1)
 
-        self.up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),  # 32 -> 64
+        # Inputs: nearest-expanded latent features (64), coarse RGB (3),
+        # and nearest-expanded boundary gate (1).
+        self.refinement = nn.Sequential(
+            nn.Conv2d(68, 32, kernel_size=3, padding=1),
+            nn.GELU(),
             nn.Conv2d(32, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
             nn.GELU(),
-        )
-
-        self.output = nn.Sequential(
             nn.Conv2d(16, 3, kernel_size=3, padding=1),
-            nn.Sigmoid(),
         )
 
-    def forward(self, features, skip32, pixel_mask):
-        mask32 = F.adaptive_max_pool2d(pixel_mask, skip32.shape[-2:])
-        visible32 = 1.0 - mask32
-        skip32 = skip32 * visible32
+    def forward(self, combined_features, mask_map):
+        if combined_features.ndim != 4 or combined_features.shape[1] != 64:
+            raise ValueError(
+                "combined_features must have shape (B,64,H,W), got "
+                f"{tuple(combined_features.shape)}"
+            )
+        if mask_map.ndim == 3:
+            mask_map = mask_map.unsqueeze(1)
+        if mask_map.shape[1] != 1:
+            raise ValueError("mask_map must have one channel")
+        if mask_map.shape[-2:] != combined_features.shape[-2:]:
+            mask_map = F.adaptive_max_pool2d(
+                mask_map, combined_features.shape[-2:]
+            )
 
-        x = self.up1(features)
-        x = torch.cat([x, skip32], dim=1)
-        x = self.refine1(x)
-        x = self.up2(x)
-        return self.output(x)
+        x = torch.cat(
+            [combined_features, mask_map.to(combined_features.dtype)], dim=1
+        )
+        latent_features = self.stem(x)
+
+        coarse_rgb = torch.sigmoid(self.coarse_rgb_head(latent_features))
+        boundary_gate = torch.sigmoid(
+            self.boundary_gate_head(latent_features)
+        )
+
+        output_size = (64, 64)
+        # Nearest expansion keeps each coarse colour constant within its region.
+        rgb_expanded = F.interpolate(
+            coarse_rgb, size=output_size, mode="nearest"
+        )
+        features_expanded = F.interpolate(
+            latent_features, size=output_size, mode="nearest"
+        )
+        boundary_expanded = F.interpolate(
+            boundary_gate, size=output_size, mode="nearest"
+        )
+
+        refinement_input = torch.cat(
+            [features_expanded, rgb_expanded, boundary_expanded], dim=1
+        )
+        colour_correction = 0.5 * torch.tanh(
+            self.refinement(refinement_input)
+        )
+
+        # The learned gate allows the refinement branch to make corrections
+        # primarily where the latent representation indicates a boundary.
+        reconstructed = rgb_expanded + boundary_expanded * colour_correction
+        return reconstructed.clamp(0.0, 1.0)
 
 
 def combine_features(context_features, predicted_tokens, target_mask):
-    """
-    Use predicted target embeddings in masked cells and context embeddings
-    in visible cells. Shapes:
-      context_features: (B, 64, 16, 16)
-      predicted_tokens: (B, 256, 64)
-      target_mask:      (B, 1, 16, 16)
-    """
-    batch_size, channels, height, width = context_features.shape
-
+    """Use context features at visible cells and predicted features at masked cells."""
+    batch, channels, height, width = context_features.shape
     context_tokens = context_features.flatten(2).transpose(1, 2)
-    mask_tokens = target_mask.flatten(1).bool()
-
-    combined_tokens = torch.where(
-        mask_tokens.unsqueeze(-1),
-        predicted_tokens,
-        context_tokens,
-    )
-
-    return combined_tokens.transpose(1, 2).reshape(
-        batch_size, channels, height, width
-    )
+    mask_tokens = target_mask.flatten(1).bool().unsqueeze(-1)
+    combined = torch.where(mask_tokens, predicted_tokens, context_tokens)
+    return combined.transpose(1, 2).reshape(batch, channels, height, width)
